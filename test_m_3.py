@@ -1,4 +1,4 @@
-import PerishableOptimalPolicy.perishable_optimal as optimal_pol
+import perishable_optimal as optimal_pol
 import sys
 import time
 
@@ -10,7 +10,7 @@ if __name__ == '__main__':
     m=3
 
     # Time horizon
-    T=50
+    T=22
 
     # holding cost
     h=1
