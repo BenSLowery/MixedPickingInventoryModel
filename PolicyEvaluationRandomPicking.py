@@ -50,7 +50,7 @@ class PolicyEvaluation():
 
         # Pre-calculare the cost functions, parellised
         self.G = {}
-        print('Pre-calculating cost function... ', end=' ')
+        print('Pre-calculating cost function... ')
         
         cl=mp.Pool(num_cores)
         # Map the calculation of the cost function. State space ar eall independent so can be computed in parallel
@@ -82,16 +82,18 @@ class PolicyEvaluation():
     
     
     def calc_post_demand(self,x,d):
+       
         """
             Calculates the post demand state according to LIFO and FIFO as a function of demand
             i.e. in Clarkson (2022) its the y_{t,i}(d_t)
         """
 
         y = []
-
+        if sum(x) <= d:
+            return [0 for i in range(self.m)]
         # Equally take inventory from each demand class
-        remainder = d % self.m
-        per_class = [d-(remainder) for i in range(self.m)]
+        remainder = int(d % self.m)
+        per_class = [(d-(remainder))/len(x) for i in range(self.m)]
         for i in range(remainder):
             per_class[i] += 1
         
@@ -99,12 +101,12 @@ class PolicyEvaluation():
 
         # Check any negative values and reassign
         excess = sum(np.abs([i for i in y if i < 0]))
+        
         while excess > 0:
-            for i in range(self.m,-1,-1):
+            for i in range(self.m-1,-1,-1):
                 if y[i] > 0:
                     excess -= 1
                     y[i] -= 1
-
 
         
         return [max(y_i,0) for y_i in y]
@@ -125,6 +127,7 @@ class PolicyEvaluation():
         return
 
     def calc_immediate_cost(self, x):
+       
         # Keep track of expectation
         Exp = 0
         
