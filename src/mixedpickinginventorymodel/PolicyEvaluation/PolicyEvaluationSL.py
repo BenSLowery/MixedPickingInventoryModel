@@ -2,13 +2,11 @@
 
 import numpy as np
 import scipy.stats as sp
-import binom_cython
+import mixedpickinginventorymodel.binom_cython as binom_cython
 import itertools
 import pickle
-import uuid
 import multiprocessing as mp
-import math
-from decimal import Decimal
+
 
 # Optimal perishing class
 class PolicyEvaluationSL():

@@ -1,4 +1,4 @@
-import perishable_optimal as optimal_pol
+import mixedpickinginventorymodel.OptimalPolicy.perishable_optimal as optimal_pol
 import sys
 import time
 
@@ -32,10 +32,9 @@ if __name__ == '__main__':
     gamma=0.999
 
     # Number of parallel processes to use
-    num_cores = int(sys.argv[1])
-
+    num_cores = 2
     #FIFO rate
-    f_r = float(sys.argv[2])
+    f_r = 0.8
     # Demand params (negative binomial)
     nb_1 = 6
     nb_2 = 0.375 # Negative binomial is defined differently in paper compared to scipy (in scipy its 1-p for parameter)

@@ -1,101 +1,20 @@
 """
-    Model of Clarkson et al. (2022) Version 5 (Storm edition)
-
-    Solve optimal policy.
-
-    * Changes to V5: 
-        1. Parrellised
-        2. Built for Storm 
+    Given a policy (i.e. a set of actions given the current state), evaluate the cost of the policy
 
 """
 
 import numpy as np
 import scipy.stats as sp
-import binom_cython
+import mixedpickinginventorymodel.binom_cython as binom_cython
 import itertools
 import pickle
 import uuid
 import multiprocessing as mp
-import math
-
 
 # Optimal perishing class
-class optimal_perishing():
-    """
-    Simulates an inventory system over a specified number of periods, based on the 
-    parameters specified during initialization. The system tracks inventory levels, 
-    demand, order quantities, and perishing of a product.
+class PolicyEvaluation():
 
-    Parameters:
-    -----------
-    periods : int
-        The number of periods to simulate.
-    lifetime : float
-        The penalty cost for each unit out of stock.
-    holding_c : float
-        The holding cost for each unit of inventory still in stock.
-    penalty_c : float
-        The cost for each unit of perished inventory.
-    order_c : float
-        The order cost for each unit
-    outdating_c : float
-        The cost per unit of outdated items
-    perish_probs : List(float)
-        The perish rates in each age class, where the i-th element represents the 
-        perish rate of the i-th class.
-    discount_factor : float
-        The gamma parameter for discounting future costs in the Dynamic Program
-    demand_params : List(string, List(float))
-        The distribution and respective demand parameters 
-    demand_truncation : int
-        The maximum demand (and subsequently order quantity) that can be taken.
-    FIFO_rate : float
-        The percentage of demand that is experienced as FIFO, the remaining 1-rate is the LIFO choice
-
-    Example:
-    --------
-    if __name__ == '__main__':
-
-        # Instance Structure
-
-        # lifetime
-        m=2
-
-        # Time horizon
-        T=10
-
-        # holding cost
-        h=1
-
-        # penalty cost
-        p=5
-
-        # outdating cost
-        theta=15
-        
-        # order cost
-        c=5
-        
-        # perish probability (for the m-1 classes)
-        psi = [0.3]
-
-
-        # Discount Factor
-        gamma=0.999
-
-        # Demand params (negative binomial)
-        nb_1 = 5
-        nb_2 = 0.2 # Negative binomial is defined differently in paper compared to scipy (in scipy its 1-p for parameter)
-
-
-        # Look at policies from 0 to 1 for FIFO rate in stages of 10%
-        for i in range(11):
-            print('FIFO rate: {}'.format(i),end = '\n')
-            instance=optimal_pol.optimal_perishing(T, m, h, p, c, theta, psi, gamma, ['NegBin', [5,0.2]], 50,4,i*0.1)
-            instance.terminal_state()
-            instance.run_dp_algo()
-    """
-    def __init__(self, periods, lifetime, holding_c, penalty_c, order_c, outdating_c, perish_prob, discount_factor, demand_params, demand_truncation, num_cores, FIFO_rate=1):
+    def __init__(self, periods, lifetime, holding_c, penalty_c, order_c, outdating_c, perish_prob, discount_factor, demand_params, demand_truncation, num_cores, FIFO_rate):
         
         # Assign inputs
         self.T = periods
@@ -111,8 +30,6 @@ class optimal_perishing():
         self.demand_val, self.demand_pmf = self.gen_demand()
         self.fifo_rate = FIFO_rate # Rate at which we assume customers are fifo/lifo in the simulation, used for the calc_post_demand() function
 
-        self.max_q = self.max_d # Maximum order is essentially capped by maximum demand possible (says in jakes code: V3_four_ages_doc_heurs_4_Ex_fns_choose_maslv_ordcost.jl line 58)
-
         self.save_output = True # Assume we can save output to pickle file, might want to set to false if running small time tests but need to do so manually
 
 
@@ -121,7 +38,7 @@ class optimal_perishing():
 
 
         # Store states and answers
-        self.optimal_pol = []
+
         self.V = [] # Previous states
 
         ########################
@@ -129,24 +46,23 @@ class optimal_perishing():
         ########################
 
         # Generate the state space
-        self.state_space = [x for x in itertools.product(*[[i for i in range(self.max_q)] for j in range(self.m)])]
+        self.state_space = [x for x in itertools.product(*[[i for i in range(self.max_d)] for j in range(self.m)])]
 
-        # Pre-calculate the cost functions, parellised
+        # Pre-calculare the cost functions, parellised
         self.G = {}
-        
         print('Pre-calculating cost function... ', end=' ')
         
         cl=mp.Pool(num_cores)
         # Map the calculation of the cost function. State space ar eall independent so can be computed in parallel
         res = cl.map(self.calc_immediate_cost,self.state_space)
-        x_max = res
+        norm_max = max(res)
+        norm_min = min(res)
         # Save to dictionary to call upon later
         for idx, x in enumerate(self.state_space):
             self.G[x] = (res[idx])
         # Close the process.
         cl.close()
-        
-        print('Done! State space size: {} \n'.format(len(self.state_space)))
+        print('Done! \n')
 
 
 
@@ -197,17 +113,14 @@ class optimal_perishing():
         mean_demand = np.sum([d*v for d,v in zip(self.demand_val, self.demand_pmf)])
 
         terminal_sum = np.sum([self.gamma**(t-2)*mean_demand for t in range(self.T)]) # Calculate sum for terminal cost
-        V_T_plus_1 = (self.gamma**(-self.T)*self.c*terminal_sum) # calculate full terminal cost
+        V_T_plus_1 = self.gamma**(-self.T)*self.c*terminal_sum # calculate full terminal cost
+
         # Assign terminal cost to each possible state
         for x in self.state_space:
             self.V.append((list(x), V_T_plus_1))
         return
 
     def calc_immediate_cost(self, x):
-        """
-            Calculate the immediate cost function G(x_t)
-        """
-
         # Keep track of expectation
         Exp = 0
         
@@ -253,54 +166,49 @@ class optimal_perishing():
                 for i in range(self.m-1): # each demand class
 
                     binom_perish_f.append(binom_cython.binom_cython(j[i], y_t[i], 1-self.psi[i])) # call cython function to calculate pmf
-                    
-                # Multiply by future value function
-                func_val_prod = binom_perish_f[0]*binom_perish_f[1]*V_t_plus_1[(q,)+j]
-                inner_fut_cost += func_val_prod
+                func_val_prod = binom_perish_f[0]*binom_perish_f[1]
+                inner_fut_cost+=func_val_prod*V_t_plus_1[(q,)+j]
             # Multiply inner cost function by the demand pmf
             fut_cost += inner_fut_cost*self.demand_pmf[d]
         return fut_cost
 
-    def calculate_cost_to_go(self, x, V_t_plus_1,t):
-        """
-            Calculate the J_t(x,q) function
-        """
-        total_cost = {}
+    def calculate_cost_to_go(self, x,q, V_t_plus_1):
+
 
         im_cost = self.G[x]
+        fut_cost = self.gamma*self.calc_future_cost(x,q,V_t_plus_1)
 
-        for q in range(self.max_q):
-            fut_cost = self.gamma*self.calc_future_cost(x,q,V_t_plus_1)
-            total_cost[q] = im_cost+fut_cost
-        opt = min(total_cost, key=total_cost.get)
-        return [x, opt, total_cost[opt]]
+        total_cost = im_cost+fut_cost
 
-    def run_dp_algo(self):
+        return [x, total_cost]
+
+    def EvalPolicy(self, policy):
         
         # Step 1. Iterate backwards recursively through all periods
         for period in range(self.T,0,-1):
-            # Keep  one step ahead optimal cost
+            print('Period: {}'.format(period))
+            # Keep future value functions
             V_t_plus_1 = {tuple(val_func[0]):val_func[1] for val_func in self.V}
             self.V = []
+            
+            # Get the set of actions/ordering decisions in this period
+            policy_t = policy[policy['period'] == period]
+
             # Step 2. Enumerate through all the possible inventory levels
             # Parellelised
-            print('Period: {}...'.format(period))
             cl = mp.Pool(self.num_cores)
-            # Use starmap as we have multiple function arguments
-            x_q_v_triplets = cl.starmap(self.calculate_cost_to_go, list(zip(self.state_space,itertools.repeat(V_t_plus_1),itertools.repeat(period))))
+            x_v_duos = cl.starmap(self.calculate_cost_to_go, list(zip(policy_t.Inventory.values,policy_t.Order.values,itertools.repeat(V_t_plus_1))))
             cl.close()
 
             # Save optimal policy and V_{t+1} function
-            for x,q,v in x_q_v_triplets:
+            for x,v in x_v_duos:
                 self.V.append((x,v))
-                self.optimal_pol.append((period, x,q))
-            print('Done!')
 
         # Save object to file
         if(self.save_output):
-            ext = str(uuid.uuid4()) # Generate unique string to not have overwriting objects
-            file = open('/beegfs/client/default/loweryb/sustainability/instances/Optimal_policy_instance_m_'+str(self.m) + '_fifo_'+ str(self.fifo_rate) +'_' + ext  + '.pkl','wb')
-            file.write(pickle.dumps(self.__dict__))
-            file.close()
+              ext = str(uuid.uuid4())
+              file = open('/beegfs/client/default/loweryb/sustainability/evaluation/testing_rate_'+ str(self.fifo_rate)  +'_with_policy_'+ str(self.input_policy_rate)  + '.pkl','wb')
+              file.write(pickle.dumps(self.V))
+              file.close()
 
-            print('Object saved w/ extension: ' +  ext)
+              print("Object Saved!")

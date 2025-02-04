@@ -1,22 +1,20 @@
 """
     Given a policy (i.e. a set of actions given the current state), evaluate the cost of the policy
-
+    Evaluate a policy under people picking according to a uniform distribution
 """
 
 import numpy as np
 import scipy.stats as sp
-import binom_cython
+import mixedpickinginventorymodel.binom_cython as binom_cython
 import itertools
 import pickle
 import uuid
 import multiprocessing as mp
-import math
-from decimal import Decimal
 
 # Optimal perishing class
 class PolicyEvaluation():
 
-    def __init__(self, periods, lifetime, holding_c, penalty_c, order_c, outdating_c, perish_prob, discount_factor, demand_params, demand_truncation, num_cores, FIFO_rate):
+    def __init__(self, periods, lifetime, holding_c, penalty_c, order_c, outdating_c, perish_prob, discount_factor, demand_params, demand_truncation, num_cores):
         
         # Assign inputs
         self.T = periods
@@ -30,8 +28,6 @@ class PolicyEvaluation():
         self.params = demand_params # Assumed stationary, can be poisson or negative binomial atm
         self.max_d = demand_truncation
         self.demand_val, self.demand_pmf = self.gen_demand()
-        self.fifo_rate = FIFO_rate # Rate at which we assume customers are fifo/lifo in the simulation, used for the calc_post_demand() function
-
         self.save_output = True # Assume we can save output to pickle file, might want to set to false if running small time tests but need to do so manually
 
 
@@ -52,7 +48,7 @@ class PolicyEvaluation():
 
         # Pre-calculare the cost functions, parellised
         self.G = {}
-        print('Pre-calculating cost function... ', end=' ')
+        print('Pre-calculating cost function... ')
         
         cl=mp.Pool(num_cores)
         # Map the calculation of the cost function. State space ar eall independent so can be computed in parallel
@@ -84,28 +80,34 @@ class PolicyEvaluation():
     
     
     def calc_post_demand(self,x,d):
+       
         """
             Calculates the post demand state according to LIFO and FIFO as a function of demand
             i.e. in Clarkson (2022) its the y_{t,i}(d_t)
         """
 
         y = []
+        if sum(x) <= d:
+            return [0 for i in range(self.m)]
+        # Equally take inventory from each demand class
+        remainder = int(d % self.m)
+        per_class = [(d-(remainder))/len(x) for i in range(self.m)]
+        for i in range(remainder):
+            per_class[i] += 1
+        
+        y = [x[i]-per_class[i] for i in range(self.m)]
 
-        # Get split
-        FIFO_d = round(self.fifo_rate*d)
-        LIFO_d = d-FIFO_d
+        # Check any negative values and reassign
+        excess = sum(np.abs([i for i in y if i < 0]))
         
-        # Realise FIFO
-        for i in range(self.m):
-            x_rest = sum([x[j] for j in range(i+1,self.m)])
-            y.append(max(x[i]-max(FIFO_d-x_rest,0),0))
+        while excess > 0:
+            for i in range(self.m-1,-1,-1):
+                if y[i] > 0:
+                    excess -= 1
+                    y[i] -= 1
+
         
-        # Realise LIFO
-        for i in range(1,self.m+1):
-            y_rest = sum([x[j] for j in range(i-1)])
-            y[i-1] = max(y[i-1]-max(LIFO_d-y_rest,0),0)
-        
-        return y
+        return [max(y_i,0) for y_i in y]
 
     def terminal_state(self):
         """
@@ -123,6 +125,7 @@ class PolicyEvaluation():
         return
 
     def calc_immediate_cost(self, x):
+       
         # Keep track of expectation
         Exp = 0
         
@@ -209,7 +212,7 @@ class PolicyEvaluation():
         # Save object to file
         if(self.save_output):
               ext = str(uuid.uuid4())
-              file = open('/beegfs/client/default/loweryb/sustainability/evaluation/testing_rate_'+ str(self.fifo_rate)  +'_with_policy_'+ str(self.input_policy_rate)  + '.pkl','wb')
+              file = open('/beegfs/client/default/loweryb/sustainability/evaluation/testing_random_picking_with_policy_'+ str(self.input_policy_rate)  + '.pkl','wb')
               file.write(pickle.dumps(self.V))
               file.close()
 

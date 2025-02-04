@@ -1,4 +1,4 @@
-import PolicyEvaluation as eval
+import mixedpickinginventorymodel.PolicyEvaluation.PolicyEvaluation as eval
 import numpy as np
 import pandas as pd
 import pickle

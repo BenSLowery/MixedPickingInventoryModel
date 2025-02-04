@@ -1,22 +1,20 @@
 """
-    Given a policy (i.e. a set of actions given the current state), evaluate the cost of the policy
-    Evaluate a policy under people picking according to a uniform distribution
+    Policy evaluation 
+    Also returing the expected shortage units across the horizon, as well as the expected waste units across the horizon
 """
 
 import numpy as np
 import scipy.stats as sp
-import binom_cython
+import mixedpickinginventorymodel.binom_cython as binom_cython
 import itertools
 import pickle
 import uuid
 import multiprocessing as mp
-import math
-from decimal import Decimal
 
 # Optimal perishing class
 class PolicyEvaluation():
 
-    def __init__(self, periods, lifetime, holding_c, penalty_c, order_c, outdating_c, perish_prob, discount_factor, demand_params, demand_truncation, num_cores):
+    def __init__(self, periods, lifetime, holding_c, penalty_c, order_c, outdating_c, perish_prob, discount_factor, demand_params, demand_truncation, num_cores, FIFO_rate):
         
         # Assign inputs
         self.T = periods
@@ -30,6 +28,8 @@ class PolicyEvaluation():
         self.params = demand_params # Assumed stationary, can be poisson or negative binomial atm
         self.max_d = demand_truncation
         self.demand_val, self.demand_pmf = self.gen_demand()
+        self.fifo_rate = FIFO_rate # Rate at which we assume customers are fifo/lifo in the simulation, used for the calc_post_demand() function
+
         self.save_output = True # Assume we can save output to pickle file, might want to set to false if running small time tests but need to do so manually
 
 
@@ -40,6 +40,8 @@ class PolicyEvaluation():
         # Store states and answers
 
         self.V = [] # Previous states
+        self.exp_shortage_V = [] # Previous states waste and shortage info
+        self.exp_waste_V = [] # Previous states waste and shortage info
 
         ########################
         # Pre-processing steps #
@@ -50,7 +52,11 @@ class PolicyEvaluation():
 
         # Pre-calculare the cost functions, parellised
         self.G = {}
-        print('Pre-calculating cost function... ')
+
+        # Calculated expected shortage and waste from the function
+        self.exp_shortage = {}
+        self.exp_waste = {}
+        print('Pre-calculating cost function... ', end=' ')
         
         cl=mp.Pool(num_cores)
         # Map the calculation of the cost function. State space ar eall independent so can be computed in parallel
@@ -59,7 +65,9 @@ class PolicyEvaluation():
         norm_min = min(res)
         # Save to dictionary to call upon later
         for idx, x in enumerate(self.state_space):
-            self.G[x] = (res[idx])
+            self.G[x] = res[idx][0]
+            self.exp_shortage[x] = res[idx][1][0]
+            self.exp_waste[x] = res[idx][1][1]
         # Close the process.
         cl.close()
         print('Done! \n')
@@ -82,34 +90,28 @@ class PolicyEvaluation():
     
     
     def calc_post_demand(self,x,d):
-       
         """
             Calculates the post demand state according to LIFO and FIFO as a function of demand
             i.e. in Clarkson (2022) its the y_{t,i}(d_t)
         """
 
         y = []
-        if sum(x) <= d:
-            return [0 for i in range(self.m)]
-        # Equally take inventory from each demand class
-        remainder = int(d % self.m)
-        per_class = [(d-(remainder))/len(x) for i in range(self.m)]
-        for i in range(remainder):
-            per_class[i] += 1
-        
-        y = [x[i]-per_class[i] for i in range(self.m)]
 
-        # Check any negative values and reassign
-        excess = sum(np.abs([i for i in y if i < 0]))
+        # Get split
+        FIFO_d = round(self.fifo_rate*d)
+        LIFO_d = d-FIFO_d
         
-        while excess > 0:
-            for i in range(self.m-1,-1,-1):
-                if y[i] > 0:
-                    excess -= 1
-                    y[i] -= 1
-
+        # Realise FIFO
+        for i in range(self.m):
+            x_rest = sum([x[j] for j in range(i+1,self.m)])
+            y.append(max(x[i]-max(FIFO_d-x_rest,0),0))
         
-        return [max(y_i,0) for y_i in y]
+        # Realise LIFO
+        for i in range(1,self.m+1):
+            y_rest = sum([x[j] for j in range(i-1)])
+            y[i-1] = max(y[i-1]-max(LIFO_d-y_rest,0),0)
+        
+        return y
 
     def terminal_state(self):
         """
@@ -124,19 +126,24 @@ class PolicyEvaluation():
         # Assign terminal cost to each possible state
         for x in self.state_space:
             self.V.append((list(x), V_T_plus_1))
+            self.exp_shortage_V.append((list(x), 0))
+            self.exp_waste_V.append((list(x), 0))
         return
 
     def calc_immediate_cost(self, x):
-       
         # Keep track of expectation
         Exp = 0
+        short =0
+        waste =  0
         
         x_tot = sum(x) # get total on hand inventory
 
         # Step 1. Discretise expectation for the parts depending on the demand
         for (d,d_pmf) in np.dstack((self.demand_val, self.demand_pmf))[0]:
             Exp += d_pmf*(self.h*max(x_tot-d,0)+self.p*max(d-x_tot,0))
-        
+
+            short += d_pmf*max(d-x_tot,0)
+
             # Step 2. Discretise the expectation for the outdating units, sum of binomial r.v
             y_d = self.calc_post_demand(x,d) # Calculate post demand state
             E_t = 0 # Log outdating costs
@@ -147,8 +154,9 @@ class PolicyEvaluation():
             # Append last demand class
             E_t += y_d[-1]
 
+            waste += d_pmf*E_t
             Exp += d_pmf*self.theta*E_t # Add all outdating costs to expectation calculation
-        return Exp
+        return Exp, (short, waste)
     
     def calc_perish_combos(self, x, d):
         """
@@ -161,12 +169,18 @@ class PolicyEvaluation():
 
         return y_t, j_d
     
-    def calc_future_cost(self,x, q, V_t_plus_1):
+    # This only works for m=3 due to the line
+    # func_val_prod = binom_perish_f[0]*binom_perish_f[1]
+    def calc_future_cost(self,x, q, V_t_plus_1, exp_shortage_plus_1, exp_waste_plus_1):
         fut_cost = 0
+        short = 0 
+        waste = 0
         for d in range(self.max_d):
             # Calculate the set of inventory combinations after perishing, and also keep post demand state for use in pmf calculation
             y_t, j_d = self.calc_perish_combos(x,d)
             inner_fut_cost = 0
+            inner_short = 0
+            inner_waste = 0
             for j in j_d: # Iterate through perishing combinations
                 
                 binom_perish_f = []
@@ -175,19 +189,30 @@ class PolicyEvaluation():
                     binom_perish_f.append(binom_cython.binom_cython(j[i], y_t[i], 1-self.psi[i])) # call cython function to calculate pmf
                 func_val_prod = binom_perish_f[0]*binom_perish_f[1]
                 inner_fut_cost+=func_val_prod*V_t_plus_1[(q,)+j]
+                inner_short += func_val_prod*exp_shortage_plus_1[(q,)+j]
+                inner_waste += func_val_prod*exp_waste_plus_1[(q,)+j]
             # Multiply inner cost function by the demand pmf
             fut_cost += inner_fut_cost*self.demand_pmf[d]
-        return fut_cost
+            short += self.demand_pmf[d]*inner_short
+            waste += self.demand_pmf[d]*inner_waste
+        return fut_cost, short, waste
 
-    def calculate_cost_to_go(self, x,q, V_t_plus_1):
+    def calculate_cost_to_go(self, x,q, V_t_plus_1,exp_shortage_plus_1,exp_waste_plus_1):
 
 
         im_cost = self.G[x]
-        fut_cost = self.gamma*self.calc_future_cost(x,q,V_t_plus_1)
+
+        fut = self.calc_future_cost(x,q,V_t_plus_1,exp_shortage_plus_1,exp_waste_plus_1)
+        fut_cost = self.gamma*fut[0]
+        fut_short = fut[1]
+        fut_waste = fut[2]
 
         total_cost = im_cost+fut_cost
 
-        return [x, total_cost]
+        shortage = self.exp_shortage[x]+fut_short
+        waste = self.exp_waste[x]+fut_waste
+
+        return [x, total_cost, shortage, waste]
 
     def EvalPolicy(self, policy):
         
@@ -196,7 +221,11 @@ class PolicyEvaluation():
             print('Period: {}'.format(period))
             # Keep future value functions
             V_t_plus_1 = {tuple(val_func[0]):val_func[1] for val_func in self.V}
+            exp_waste_plus_1 = {tuple(val_func[0]):val_func[1] for val_func in self.exp_waste_V}
+            exp_shortage_plus_1 = {tuple(val_func[0]):val_func[1] for val_func in self.exp_shortage_V}
             self.V = []
+            self.exp_waste_V = []
+            self.exp_shortage_V = []
             
             # Get the set of actions/ordering decisions in this period
             policy_t = policy[policy['period'] == period]
@@ -204,17 +233,19 @@ class PolicyEvaluation():
             # Step 2. Enumerate through all the possible inventory levels
             # Parellelised
             cl = mp.Pool(self.num_cores)
-            x_v_duos = cl.starmap(self.calculate_cost_to_go, list(zip(policy_t.Inventory.values,policy_t.Order.values,itertools.repeat(V_t_plus_1))))
+            x_v_duos = cl.starmap(self.calculate_cost_to_go, list(zip(policy_t.Inventory.values,policy_t.Order.values,itertools.repeat(V_t_plus_1),itertools.repeat(exp_shortage_plus_1),itertools.repeat(exp_waste_plus_1))))
             cl.close()
 
             # Save optimal policy and V_{t+1} function
-            for x,v in x_v_duos:
+            for x,v,s,w in x_v_duos:
                 self.V.append((x,v))
+                self.exp_shortage_V.append((x,s))
+                self.exp_waste_V.append((x,w))
 
         # Save object to file
         if(self.save_output):
               ext = str(uuid.uuid4())
-              file = open('/beegfs/client/default/loweryb/sustainability/evaluation/testing_random_picking_with_policy_'+ str(self.input_policy_rate)  + '.pkl','wb')
+              file = open('/beegfs/client/default/loweryb/sustainability/evaluation/testing_rate_'+ str(self.fifo_rate)  +'_with_policy_'+ str(self.input_policy_rate)  + '.pkl','wb')
               file.write(pickle.dumps(self.V))
               file.close()
 
