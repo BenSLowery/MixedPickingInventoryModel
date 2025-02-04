@@ -8,7 +8,6 @@ import scipy.stats as sp
 import mixedpickinginventorymodel.binom_cython as binom_cython
 import itertools
 import pickle
-import uuid
 import multiprocessing as mp
 
 # Optimal perishing class
@@ -211,8 +210,7 @@ class PolicyEvaluation():
 
         # Save object to file
         if(self.save_output):
-              ext = str(uuid.uuid4())
-              file = open('/beegfs/client/default/loweryb/sustainability/evaluation/testing_random_picking_with_policy_'+ str(self.input_policy_rate)  + '.pkl','wb')
+              file = open('./evaluation/testing_random_picking_with_policy_'+ str(self.input_policy_rate)  + '.pkl','wb')
               file.write(pickle.dumps(self.V))
               file.close()
 
